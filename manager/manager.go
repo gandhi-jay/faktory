@@ -68,26 +68,51 @@ type Manager interface {
 	RetryJobs() (int64, error)
 
 	BusyCount(wid string) int
+
+	AddMiddleware(fntype string, fn MiddlewareFunc)
 }
 
 func NewManager(s storage.Store) Manager {
 	m := &manager{
 		store:      s,
 		workingMap: map[string]*Reservation{},
+		pushChain:  make(MiddlewareChain, 0),
+		failChain:  make(MiddlewareChain, 0),
+		ackChain:   make(MiddlewareChain, 0),
+		fetchChain: make(MiddlewareChain, 0),
 	}
 	m.loadWorkingSet()
 	return m
+}
+
+func (m *manager) AddMiddleware(fntype string, fn MiddlewareFunc) {
+	switch fntype {
+	case "push":
+		m.pushChain = append(m.pushChain, fn)
+	case "ack":
+		m.ackChain = append(m.ackChain, fn)
+	case "fail":
+		m.failChain = append(m.failChain, fn)
+	case "fetch":
+		m.fetchChain = append(m.fetchChain, fn)
+	default:
+		panic(fmt.Sprintf("Unknown middleware type: %s", fntype))
+	}
 }
 
 type manager struct {
 	store storage.Store
 
 	// Hold the working set in memory so we don't need to burn CPU
-	// marshalling between Rocks and memory when doing 1000s of jobs/sec.
+	// when doing 1000s of jobs/sec.
 	// When client ack's JID, we can lookup reservation
-	// and remove Rocks entry quickly.
+	// and remove stored entry quickly.
 	workingMap   map[string]*Reservation
 	workingMutex sync.RWMutex
+	pushChain    MiddlewareChain
+	fetchChain   MiddlewareChain
+	failChain    MiddlewareChain
+	ackChain     MiddlewareChain
 }
 
 func (m *manager) Push(job *client.Job) error {
@@ -127,11 +152,7 @@ func (m *manager) Push(job *client.Job) error {
 			}
 
 			// scheduler for later
-			err = m.store.Scheduled().AddElement(job.At, job.Jid, data)
-			if err != nil {
-				return err
-			}
-			return nil
+			return m.store.Scheduled().AddElement(job.At, job.Jid, data)
 		}
 	}
 
@@ -151,15 +172,13 @@ func (m *manager) enqueue(job *client.Job) error {
 		return err
 	}
 
-	err = q.Push(job.Priority, data)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return callMiddleware(m.pushChain, job, func() error {
+		return q.Push(job.Priority, data)
+	})
 }
 
 func (m *manager) Fetch(ctx context.Context, wid string, queues ...string) (*client.Job, error) {
+restart:
 	var first storage.Queue
 
 	for idx, qname := range queues {
@@ -178,7 +197,14 @@ func (m *manager) Fetch(ctx context.Context, wid string, queues ...string) (*cli
 			if err != nil {
 				return nil, err
 			}
-			err = m.reserve(wid, &job)
+			err = callMiddleware(m.fetchChain, &job, func() error {
+				return m.reserve(wid, &job)
+			})
+			if h, ok := err.(halt); ok {
+				// middleware halted the fetch, for whatever reason
+				util.Debugf("JID %s: %s", job.Jid, h.Error())
+				goto restart
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -187,6 +213,10 @@ func (m *manager) Fetch(ctx context.Context, wid string, queues ...string) (*cli
 		if idx == 0 {
 			first = q
 		}
+	}
+
+	if first == nil {
+		return nil, fmt.Errorf("Fetch must be called with one or more queue names")
 	}
 
 	// scanned through our queues, no jobs were available
@@ -203,7 +233,14 @@ func (m *manager) Fetch(ctx context.Context, wid string, queues ...string) (*cli
 		if err != nil {
 			return nil, err
 		}
-		err = m.reserve(wid, &job)
+		err = callMiddleware(m.fetchChain, &job, func() error {
+			return m.reserve(wid, &job)
+		})
+		if h, ok := err.(halt); ok {
+			// middleware halted the fetch, for whatever reason
+			util.Debugf("JID %s: %s", job.Jid, h.Error())
+			goto restart
+		}
 		if err != nil {
 			return nil, err
 		}

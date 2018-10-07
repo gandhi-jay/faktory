@@ -12,15 +12,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/contribsys/faktory/storage"
 	"github.com/stretchr/testify/assert"
 )
 
 func runServer(binding string, runner func()) {
-	dir := strings.Replace(binding, ":", "_", 1)
-	os.RemoveAll("/tmp/" + dir)
+	dir := fmt.Sprintf("/tmp/%s", strings.Replace(binding, ":", "_", 1))
+	defer os.RemoveAll(dir)
+
+	sock := fmt.Sprintf("%s/test.sock", dir)
+	storage.BootRedis(dir, sock)
+	defer storage.StopRedis(sock)
+
 	opts := &ServerOptions{
 		Binding:          binding,
-		StorageDirectory: "/tmp/" + dir,
+		StorageDirectory: dir,
+		RedisSock:        sock,
 		ConfigDirectory:  os.ExpandEnv("$HOME/.faktory"),
 	}
 	s, err := NewServer(opts)
@@ -43,7 +50,6 @@ func runServer(binding string, runner func()) {
 }
 
 func TestServerStart(t *testing.T) {
-	t.Parallel()
 	runServer("localhost:7420", func() {
 		conn, err := net.DialTimeout("tcp", "localhost:7420", 1*time.Second)
 		assert.NoError(t, err)

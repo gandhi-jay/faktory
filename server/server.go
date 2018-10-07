@@ -21,42 +21,25 @@ import (
 	"github.com/contribsys/faktory/util"
 )
 
-var (
-	EventHandlers = make([]func(*Server) error, 0)
-)
-
-type ServerOptions struct {
-	Binding          string
-	StorageDirectory string
-	ConfigDirectory  string
-	Environment      string
-}
-
 type RuntimeStats struct {
-	Connections int64
-	Commands    int64
+	Connections uint64
+	Commands    uint64
 	StartedAt   time.Time
 }
 
 type Server struct {
-	Options  *ServerOptions
-	Stats    *RuntimeStats
-	Password string
+	Options    *ServerOptions
+	Stats      *RuntimeStats
+	Subsystems []Subsystem
 
 	listener   net.Listener
 	store      storage.Store
 	manager    manager.Manager
 	workers    *workers
 	taskRunner *taskRunner
-	pending    *sync.WaitGroup
 	mu         sync.Mutex
+	stopper    chan bool
 	closed     bool
-}
-
-// register a global handler to be called when the Server instance
-// has finished booting but before it starts listening.
-func OnStart(x func(*Server) error) {
-	EventHandlers = append(EventHandlers, x)
 }
 
 func NewServer(opts *ServerOptions) (*Server, error) {
@@ -68,17 +51,13 @@ func NewServer(opts *ServerOptions) (*Server, error) {
 	}
 
 	s := &Server{
-		Options: opts,
-		Stats:   &RuntimeStats{StartedAt: time.Now()},
-		pending: &sync.WaitGroup{},
+		Options:    opts,
+		Stats:      &RuntimeStats{StartedAt: time.Now()},
+		Subsystems: []Subsystem{},
+
+		stopper: make(chan bool),
 		closed:  false,
 	}
-
-	pwd, err := fetchPassword(s.Options)
-	if err != nil {
-		return nil, err
-	}
-	s.Password = pwd
 
 	return s, nil
 }
@@ -95,8 +74,21 @@ func (s *Server) Manager() manager.Manager {
 	return s.manager
 }
 
+func (s *Server) Reload() {
+	for _, x := range s.Subsystems {
+		err := x.Reload(s)
+		if err != nil {
+			util.Warnf("Subsystem %v returned reload error: %v", x, err)
+		}
+	}
+}
+
+func (s *Server) AddTask(everySec int64, task Taskable) {
+	s.taskRunner.AddTask(everySec, task)
+}
+
 func (s *Server) Boot() error {
-	store, err := storage.Open("rocksdb", s.Options.StorageDirectory)
+	store, err := storage.Open("redis", s.Options.RedisSock)
 	if err != nil {
 		return err
 	}
@@ -112,20 +104,20 @@ func (s *Server) Boot() error {
 	s.workers = newWorkers()
 	s.manager = manager.NewManager(store)
 	s.listener = listener
-	s.startTasks(s.pending)
+	s.stopper = make(chan bool)
+	s.startTasks()
 	s.mu.Unlock()
 
 	return nil
 }
 
 func (s *Server) Run() error {
-	// NB: defers happen in reverse order
-	defer s.store.Close()
-	defer s.pending.Wait()
-	defer s.taskRunner.Stop()
+	if s.store == nil {
+		panic("Server hasn't been booted")
+	}
 
-	for _, x := range EventHandlers {
-		err := x(s)
+	for _, x := range s.Subsystems {
+		err := x.Start(s)
 		if err != nil {
 			return err
 		}
@@ -133,7 +125,7 @@ func (s *Server) Run() error {
 
 	util.Infof("PID %d listening at %s, press Ctrl-C to stop", os.Getpid(), s.Options.Binding)
 
-	// this is the central runtime loop for the main goroutine
+	// this is the runtime loop for the command server
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -149,32 +141,31 @@ func (s *Server) Run() error {
 	}
 }
 
-func (s *Server) isClosed() bool {
-	return s.closed
+func (s *Server) Stopper() chan bool {
+	return s.stopper
 }
 
 func (s *Server) Stop(f func()) {
 	// Don't allow new network connections
 	s.mu.Lock()
-	if s.closed {
-		return
-	}
 	s.closed = true
 	if s.listener != nil {
 		s.listener.Close()
 	}
 	s.mu.Unlock()
+
 	time.Sleep(100 * time.Millisecond)
 
 	if f != nil {
 		f()
 	}
+
+	s.store.Close()
 }
 
 func hash(pwd, salt string, iterations int) string {
 	bytes := []byte(pwd + salt)
-	var hash [32]byte
-	hash = sha256.Sum256(bytes)
+	hash := sha256.Sum256(bytes)
 	if iterations > 1 {
 		for i := 1; i < iterations; i++ {
 			hash = sha256.Sum256(hash[:])
@@ -192,7 +183,7 @@ func startConnection(conn net.Conn, s *Server) *Connection {
 
 	var salt string
 	conn.Write([]byte(`+HI {"v":2`))
-	if s.Password != "" {
+	if s.Options.Password != "" {
 		conn.Write([]byte(`,"i":`))
 		iters := strconv.FormatInt(int64(iter), 10)
 		conn.Write([]byte(iters))
@@ -229,12 +220,12 @@ func startConnection(conn net.Conn, s *Server) *Connection {
 		return nil
 	}
 
-	if s.Password != "" {
+	if s.Options.Password != "" {
 		if client.Version < 2 {
 			iter = 1
 		}
 
-		if subtle.ConstantTimeCompare([]byte(client.PasswordHash), []byte(hash(s.Password, salt, iter))) != 1 {
+		if subtle.ConstantTimeCompare([]byte(client.PasswordHash), []byte(hash(s.Options.Password, salt, iter))) != 1 {
 			conn.Write([]byte("-ERR Invalid password\r\n"))
 			conn.Close()
 			return nil
@@ -265,8 +256,8 @@ func startConnection(conn net.Conn, s *Server) *Connection {
 }
 
 func (s *Server) processLines(conn *Connection) {
-	atomic.AddInt64(&s.Stats.Connections, 1)
-	defer atomic.AddInt64(&s.Stats.Connections, -1)
+	atomic.AddUint64(&s.Stats.Connections, 1)
+	defer atomic.AddUint64(&s.Stats.Connections, ^uint64(0))
 
 	for {
 		cmd, e := conn.buf.ReadString('\n')
@@ -277,7 +268,7 @@ func (s *Server) processLines(conn *Connection) {
 			conn.Close()
 			return
 		}
-		if s.isClosed() {
+		if s.closed {
 			conn.Error("Closing connection", newTaggedError("SHUTDOWN", fmt.Errorf("Shutdown in progress")))
 			conn.Close()
 			return
@@ -295,7 +286,7 @@ func (s *Server) processLines(conn *Connection) {
 		if !ok {
 			conn.Error(cmd, fmt.Errorf("Unknown command %s", verb))
 		} else {
-			atomic.AddInt64(&s.Stats.Commands, 1)
+			atomic.AddUint64(&s.Stats.Commands, 1)
 			proc(conn, s, cmd)
 		}
 		if verb == "END" {
@@ -326,16 +317,16 @@ func (s *Server) CurrentState() (map[string]interface{}, error) {
 		"server_utc_time": time.Now().UTC().Format("03:04:05 UTC"),
 		"faktory": map[string]interface{}{
 			"default_size":    defalt.Size(),
-			"total_failures":  s.store.Failures(),
-			"total_processed": s.store.Processed(),
+			"total_failures":  s.store.TotalFailures(),
+			"total_processed": s.store.TotalProcessed(),
 			"total_enqueued":  totalQueued,
 			"total_queues":    totalQueues,
 			"tasks":           s.taskRunner.Stats()},
 		"server": map[string]interface{}{
 			"faktory_version": client.Version,
 			"uptime":          s.uptimeInSeconds(),
-			"connections":     atomic.LoadInt64(&s.Stats.Connections),
-			"command_count":   atomic.LoadInt64(&s.Stats.Commands),
+			"connections":     atomic.LoadUint64(&s.Stats.Connections),
+			"command_count":   atomic.LoadUint64(&s.Stats.Commands),
 			"used_memory_mb":  util.MemoryUsage()},
 	}, nil
 }

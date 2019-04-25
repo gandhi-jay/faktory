@@ -35,7 +35,6 @@ type redisStore struct {
 }
 
 var (
-	opens      = 0
 	instances  = map[string]*exec.Cmd{}
 	redisMutex = sync.Mutex{}
 )
@@ -100,6 +99,7 @@ func BootRedis(path string, sock string) (func(), error) {
 		util.Debugf("Booting Redis: %s", strings.Join(arguments, " "))
 
 		cmd := exec.Command(arguments[0], arguments[1:]...)
+		util.EnsureChildShutdown(cmd, util.SIGTERM) // platform-specific tuning
 		//cmd.Stdout = os.Stdout
 		//cmd.Stderr = os.Stderr
 		instances[sock] = cmd
@@ -179,9 +179,10 @@ func OpenRedis(sock string) (Store, error) {
 	rs.initSorted()
 
 	rs.rclient = redis.NewClient(&redis.Options{
-		Network: "unix",
-		Addr:    sock,
-		DB:      db,
+		Network:  "unix",
+		Addr:     sock,
+		DB:       db,
+		PoolSize: 1000,
 	})
 	_, err := rs.rclient.Ping().Result()
 	if err != nil {
@@ -243,9 +244,7 @@ func (store *redisStore) Close() error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
-	err := store.rclient.Close()
-	store.rclient = nil
-	return err
+	return store.rclient.Close()
 }
 
 func (store *redisStore) Redis() *redis.Client {
@@ -280,7 +279,7 @@ func StopRedis(sock string) error {
 		time.Sleep(2 * time.Millisecond)
 		err := syscall.Kill(pid, syscall.Signal(0))
 		if err == syscall.ESRCH {
-			util.Debugf("Redis dead in %v", time.Now().Sub(before))
+			util.Debugf("Redis dead in %v", time.Since(before))
 			return nil
 		}
 	}
@@ -370,12 +369,12 @@ const (
 # Created by Faktory %s
 bind 127.0.0.1 ::1
 port 0
-tcp-backlog 128
 
+# Faktory's redis is only available via local Unix socket.
+# This maximizes performance and minimizes opsec risk.
 unixsocket /tmp/faktory-redis.sock
 unixsocketperm 700
 timeout 0
-tcp-keepalive 30
 
 daemonize no
 maxmemory-policy noeviction
@@ -389,9 +388,10 @@ maxmemory-policy noeviction
 loglevel notice
 logfile /tmp/faktory-redis.log
 
-save 900 1
-save 300 10
-save 60 100
+# we're pretty aggressive on persistence to minimize data loss.
+# remember you can take backups of the RDB file with a simple 'cp'.
+save 120 1
+save 30 5
 stop-writes-on-bgsave-error yes
 rdbcompression yes
 rdbchecksum yes

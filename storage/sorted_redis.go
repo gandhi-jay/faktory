@@ -49,6 +49,10 @@ func (rs *redisSorted) Add(job *client.Job) error {
 	return rs.AddElement(job.At, job.Jid, data)
 }
 
+func (rs *redisSorted) RemoveEntry(ent SortedEntry) error {
+	return rs.store.rclient.ZRem(rs.name, ent.Value()).Err()
+}
+
 func (rs *redisSorted) AddElement(timestamp string, jid string, payload []byte) error {
 	tim, err := util.ParseTime(timestamp)
 	if err != nil {
@@ -158,8 +162,32 @@ func (e *setEntry) Job() (*client.Job, error) {
 	return e.job, nil
 }
 
+func (rs *redisSorted) Find(match string, fn func(index int, e SortedEntry) error) error {
+	it := rs.store.rclient.ZScan(rs.name, 0, match, 100).Iterator()
+	idx := 0
+	for it.Next() {
+		job := it.Val()
+		if !it.Next() {
+			break
+		}
+		score := it.Val()
+		sf, err := strconv.ParseFloat(score, 64)
+		if err != nil {
+			return err
+		}
+		if err := fn(idx, NewEntry(sf, []byte(job))); err != nil {
+			return err
+		}
+		idx += 1
+	}
+	if err := it.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (rs *redisSorted) Page(start int, count int, fn func(index int, e SortedEntry) error) (int, error) {
-	zs, err := rs.store.rclient.ZRangeWithScores(rs.name, int64(start), int64(start+count)).Result()
+	zs, err := rs.store.rclient.ZRangeWithScores(rs.name, int64(start), int64(start+count-1)).Result()
 	if err != nil {
 		return 0, err
 	}
@@ -174,11 +202,10 @@ func (rs *redisSorted) Page(start int, count int, fn func(index int, e SortedEnt
 }
 
 func (rs *redisSorted) Each(fn func(idx int, e SortedEntry) error) error {
+	count := 50
+	current := 0
 
 	for {
-		count := 50
-		current := 0
-
 		elms, err := rs.Page(current, count, fn)
 		if err != nil {
 			return err

@@ -21,8 +21,11 @@ func runServer(binding string, runner func()) {
 	defer os.RemoveAll(dir)
 
 	sock := fmt.Sprintf("%s/test.sock", dir)
-	storage.BootRedis(dir, sock)
-	defer storage.StopRedis(sock)
+	stopper, err := storage.BootRedis(dir, sock)
+	if err != nil {
+		panic(err)
+	}
+	defer stopper()
 
 	opts := &ServerOptions{
 		Binding:          binding,
@@ -93,6 +96,7 @@ func TestServerStart(t *testing.T) {
 		result, err = buf.ReadString('\n')
 		assert.NoError(t, err)
 		assert.Regexp(t, "12345678901234567890abcd", result)
+		assert.Regexp(t, "\"retry\":", result)
 
 		hash := make(map[string]interface{})
 		err = json.Unmarshal([]byte(result), &hash)
@@ -121,6 +125,16 @@ func TestServerStart(t *testing.T) {
 		err = json.Unmarshal([]byte(result), &stats)
 		assert.NoError(t, err)
 		assert.Equal(t, 3, len(stats))
+
+		conn.Write([]byte(fmt.Sprintf("BEAT {\"wid\":\"%s\"}\n", client.Wid)))
+		result, err = buf.ReadString('\n')
+		assert.NoError(t, err)
+		assert.Equal(t, "+OK\r\n", result)
+
+		conn.Write([]byte(fmt.Sprintf("FLUSH\n")))
+		result, err = buf.ReadString('\n')
+		assert.NoError(t, err)
+		assert.Equal(t, "+OK\r\n", result)
 
 		conn.Write([]byte("END\n"))
 		//result, err = buf.ReadString('\n')

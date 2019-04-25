@@ -10,6 +10,7 @@ import (
 	"github.com/contribsys/faktory/client"
 	"github.com/contribsys/faktory/storage"
 	"github.com/contribsys/faktory/util"
+	"github.com/go-redis/redis"
 )
 
 const (
@@ -21,6 +22,36 @@ const (
 	// Save dead jobs for 180 days, after that they will be purged
 	DeadTTL = 180 * 24 * time.Hour
 )
+
+// A KnownError is one that returns a specific error code to the client
+// such that it can be handled explicitly.  For example, the unique job feature
+// will return a NOTUNIQUE error when the client tries to push() a job that already
+// exists in Faktory.
+//
+// Unexpected errors will always use "ERR" as their code, for instance any
+// malformed data, network errors, IO errors, etc.  Clients are expected to
+// raise an exception for any ERR response.
+type KnownError interface {
+	error
+	Code() string
+}
+
+type codedError struct {
+	code string
+	msg  string
+}
+
+func (t *codedError) Error() string {
+	return fmt.Sprintf("%s %s", t.code, t.msg)
+}
+
+func (t *codedError) Code() string {
+	return t.code
+}
+
+func ExpectedError(code string, msg string) error {
+	return &codedError{code: code, msg: msg}
+}
 
 type Manager interface {
 	Push(job *client.Job) error
@@ -70,6 +101,9 @@ type Manager interface {
 	BusyCount(wid string) int
 
 	AddMiddleware(fntype string, fn MiddlewareFunc)
+
+	KV() storage.KV
+	Redis() *redis.Client
 }
 
 func NewManager(s storage.Store) Manager {
@@ -83,6 +117,14 @@ func NewManager(s storage.Store) Manager {
 	}
 	m.loadWorkingSet()
 	return m
+}
+
+func (m *manager) KV() storage.KV {
+	return m.store.Raw()
+}
+
+func (m *manager) Redis() *redis.Client {
+	return m.store.Redis()
 }
 
 func (m *manager) AddMiddleware(fntype string, fn MiddlewareFunc) {
@@ -125,6 +167,9 @@ func (m *manager) Push(job *client.Job) error {
 	if job.Args == nil {
 		return fmt.Errorf("All jobs must have an args parameter")
 	}
+	if job.ReserveFor > 86400 {
+		return fmt.Errorf("Jobs cannot be reserved for more than one day")
+	}
 
 	if job.CreatedAt == "" {
 		job.CreatedAt = util.Nows()
@@ -132,11 +177,6 @@ func (m *manager) Push(job *client.Job) error {
 
 	if job.Queue == "" {
 		job.Queue = "default"
-	}
-
-	// Priority can never be negative because of signedness
-	if job.Priority > 9 || job.Priority == 0 {
-		job.Priority = 5
 	}
 
 	if job.At != "" {
@@ -166,15 +206,21 @@ func (m *manager) enqueue(job *client.Job) error {
 		return err
 	}
 
-	job.EnqueuedAt = util.Nows()
-	data, err := json.Marshal(job)
-	if err != nil {
-		return err
-	}
-
-	return callMiddleware(m.pushChain, job, func() error {
-		return q.Push(job.Priority, data)
+	err = callMiddleware(m.pushChain, Ctx{context.Background(), job, m, nil}, func() error {
+		job.EnqueuedAt = util.Nows()
+		data, err := json.Marshal(job)
+		if err != nil {
+			return err
+		}
+		//util.Debugf("pushed: %+v", job)
+		return q.Push(data)
 	})
+	if err != nil {
+		if k, ok := err.(KnownError); ok {
+			util.Infof("JID %s: %s", job.Jid, k.Error())
+		}
+	}
+	return err
 }
 
 func (m *manager) Fetch(ctx context.Context, wid string, queues ...string) (*client.Job, error) {
@@ -197,13 +243,15 @@ restart:
 			if err != nil {
 				return nil, err
 			}
-			err = callMiddleware(m.fetchChain, &job, func() error {
+			err = callMiddleware(m.fetchChain, Ctx{ctx, &job, m, nil}, func() error {
 				return m.reserve(wid, &job)
 			})
-			if h, ok := err.(halt); ok {
-				// middleware halted the fetch, for whatever reason
-				util.Debugf("JID %s: %s", job.Jid, h.Error())
-				goto restart
+			if h, ok := err.(KnownError); ok {
+				util.Infof("JID %s: %s", job.Jid, h.Error())
+				if h.Code() == "DISCARD" {
+					goto restart
+				}
+				return nil, err
 			}
 			if err != nil {
 				return nil, err
@@ -233,13 +281,15 @@ restart:
 		if err != nil {
 			return nil, err
 		}
-		err = callMiddleware(m.fetchChain, &job, func() error {
+		err = callMiddleware(m.fetchChain, Ctx{ctx, &job, m, nil}, func() error {
 			return m.reserve(wid, &job)
 		})
-		if h, ok := err.(halt); ok {
-			// middleware halted the fetch, for whatever reason
+		if h, ok := err.(KnownError); ok {
 			util.Debugf("JID %s: %s", job.Jid, h.Error())
-			goto restart
+			if h.Code() == "DISCARD" {
+				goto restart
+			}
+			return nil, err
 		}
 		if err != nil {
 			return nil, err

@@ -37,6 +37,14 @@ func TestPages(t *testing.T) {
 			assert.NoError(t, err)
 
 			s.Stats.StartedAt = time.Now().Add(-1234567 * time.Second)
+			str := s.Store()
+			str.GetQueue("default")
+			q, _ := str.GetQueue("foobar")
+			q.Clear()
+			args := []string{"faktory", "rocks", "!!", ":)"}
+			for _, v := range args {
+				q.Push([]byte(v))
+			}
 
 			w := httptest.NewRecorder()
 			statsHandler(w, req)
@@ -50,6 +58,12 @@ func TestPages(t *testing.T) {
 			s := content["server"].(map[string]interface{})
 			uid := s["uptime"].(float64)
 			assert.Equal(t, float64(1234567), uid)
+
+			queues := content["faktory"].(map[string]interface{})["queues"].(map[string]interface{})
+			defaultQ := queues["default"].(float64)
+			assert.Equal(t, 0.0, defaultQ)
+			foobarQ := queues["foobar"].(float64)
+			assert.Equal(t, float64(len(args)), foobarQ)
 		})
 
 		t.Run("Queues", func(t *testing.T) {
@@ -60,7 +74,7 @@ func TestPages(t *testing.T) {
 			str.GetQueue("default")
 			q, _ := str.GetQueue("foobar")
 			q.Clear()
-			q.Push(5, []byte("1l23j12l3"))
+			q.Push([]byte("1l23j12l3"))
 
 			w := httptest.NewRecorder()
 			queuesHandler(w, req)
@@ -77,7 +91,7 @@ func TestPages(t *testing.T) {
 			str := s.Store()
 			q, _ := str.GetQueue("foobar")
 			q.Clear()
-			q.Push(5, []byte(`{"jobtype":"SomeWorker","args":["1l23j12l3"],"queue":"foobar"}`))
+			q.Push([]byte(`{"jobtype":"SomeWorker","args":["1l23j12l3"],"queue":"foobar"}`))
 			assert.EqualValues(t, 1, q.Size())
 
 			w := httptest.NewRecorder()

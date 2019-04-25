@@ -1,6 +1,48 @@
 # Faktory Changelog
 
-## 0.9.0-beta
+## 1.0.0
+
+- Support known, specific errors to be returned to clients [#208]
+- All jobs now default to `"retry":25` if not specified when pushed [#211]
+- Update job arguments within Web UI to show as JSON, not native Go [#210]
+
+## 0.9.7
+
+- Add new MUTATE command which allows bulk manipulation of Faktory's
+  persistent sets (i.e. scheduled, retries, dead) [#205]
+  See https://github.com/contribsys/faktory/wiki/Mutate-API
+
+## 0.9.6
+
+- Remove legacy job priority from APIs and Job struct
+- Improve display of job arguments and custom elements in Web UI [#199]
+
+## 0.9.5
+
+- Add queue sizes to the INFO stats [#197, thapakazi]
+- Fix infinite loop with sorted set iteration [#196, antoinefinkelstein]
+
+## 0.9.4
+
+- More aggressive Redis persistence [#195]
+- Fix possible race condition panic on new connection
+
+## 0.9.3
+
+- Increase maximum client count to 1000.
+
+## 0.9.2
+
+- Fix crash under load [#187]
+- First [Faktory Pro](https://contribsys.com/faktory) release
+
+## 0.9.1
+
+- Fix crash on startup in Linux in development mode
+- Close all associated connections when a worker process expires [#182]
+- Shutdown Redis cleanly if Faktory panics (Linux only)
+
+## 0.9.0
 
 - Switch Faktory from RocksDB to Redis for storage. [#160]
 - Implement Faktory-internal middleware hooks [#168]

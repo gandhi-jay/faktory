@@ -18,14 +18,15 @@ import (
 type command func(c *Connection, s *Server, cmd string)
 
 var cmdSet = map[string]command{
-	"END":   end,
-	"PUSH":  push,
-	"FETCH": fetch,
-	"ACK":   ack,
-	"FAIL":  fail,
-	"BEAT":  heartbeat,
-	"INFO":  info,
-	"FLUSH": flush,
+	"END":    end,
+	"PUSH":   push,
+	"FETCH":  fetch,
+	"ACK":    ack,
+	"FAIL":   fail,
+	"BEAT":   heartbeat,
+	"INFO":   info,
+	"FLUSH":  flush,
+	"MUTATE": mutate,
 }
 
 func flush(c *Connection, s *Server, cmd string) {
@@ -51,9 +52,13 @@ func push(c *Connection, s *Server, cmd string) {
 	data := cmd[5:]
 
 	var job client.Job
+	// If retry is not set, the `json` package won't touch the Retry attribute.
+	// We want it to default to 25 if there is no attribute passed to us.
+	job.Retry = 25
+
 	err := json.Unmarshal([]byte(data), &job)
 	if err != nil {
-		c.Error(cmd, newTaggedError("MALFORMED", err))
+		c.Error(cmd, fmt.Errorf("Invalid JSON: %s", err))
 		return
 	}
 
@@ -161,7 +166,7 @@ func heartbeat(c *Connection, s *Server, cmd string) {
 		return
 	}
 
-	worker, ok := s.workers.heartbeat(&client, false)
+	worker, ok := s.workers.heartbeat(&client, nil)
 	if !ok {
 		c.Error(cmd, fmt.Errorf("Unknown worker %s", client.Wid))
 		return

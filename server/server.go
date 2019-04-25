@@ -19,6 +19,7 @@ import (
 	"github.com/contribsys/faktory/manager"
 	"github.com/contribsys/faktory/storage"
 	"github.com/contribsys/faktory/util"
+	"github.com/go-redis/redis"
 )
 
 type RuntimeStats struct {
@@ -78,7 +79,7 @@ func (s *Server) Reload() {
 	for _, x := range s.Subsystems {
 		err := x.Reload(s)
 		if err != nil {
-			util.Warnf("Subsystem %v returned reload error: %v", x, err)
+			util.Warnf("Subsystem %s returned reload error: %v", x.Name(), err)
 		}
 	}
 }
@@ -119,6 +120,8 @@ func (s *Server) Run() error {
 	for _, x := range s.Subsystems {
 		err := x.Start(s)
 		if err != nil {
+			util.Error("Subsystem failed to start", err)
+			close(s.Stopper())
 			return err
 		}
 	}
@@ -136,6 +139,7 @@ func (s *Server) Run() error {
 			if c == nil {
 				return
 			}
+			defer cleanupConnection(s, c)
 			s.processLines(c)
 		}(conn)
 	}
@@ -161,6 +165,11 @@ func (s *Server) Stop(f func()) {
 	}
 
 	s.store.Close()
+}
+
+func cleanupConnection(s *Server, c *Connection) {
+	//util.Debugf("Removing client connection %v", c)
+	s.workers.RemoveConnection(c)
 }
 
 func hash(pwd, salt string, iterations int) string {
@@ -232,10 +241,16 @@ func startConnection(conn net.Conn, s *Server) *Connection {
 		}
 	}
 
+	cn := &Connection{
+		client: client,
+		conn:   conn,
+		buf:    buf,
+	}
+
 	if client.Wid == "" {
 		// a producer, not a consumer connection
 	} else {
-		s.workers.heartbeat(client, true)
+		s.workers.heartbeat(client, cn)
 	}
 
 	_, err = conn.Write([]byte("+OK\r\n"))
@@ -248,11 +263,7 @@ func startConnection(conn net.Conn, s *Server) *Connection {
 	// disable deadline
 	conn.SetDeadline(time.Time{})
 
-	return &Connection{
-		client: client,
-		conn:   conn,
-		buf:    buf,
-	}
+	return cn
 }
 
 func (s *Server) processLines(conn *Connection) {
@@ -269,7 +280,7 @@ func (s *Server) processLines(conn *Connection) {
 			return
 		}
 		if s.closed {
-			conn.Error("Closing connection", newTaggedError("SHUTDOWN", fmt.Errorf("Shutdown in progress")))
+			conn.Error("Closing connection", fmt.Errorf("Shutdown in progress"))
 			conn.Close()
 			return
 		}
@@ -300,33 +311,43 @@ func (s *Server) uptimeInSeconds() int {
 }
 
 func (s *Server) CurrentState() (map[string]interface{}, error) {
-	defalt, err := s.store.GetQueue("default")
+	queueCmd := map[string]*redis.IntCmd{}
+	_, err := s.store.Redis().Pipelined(func(pipe redis.Pipeliner) error {
+		s.store.EachQueue(func(q storage.Queue) {
+			queueCmd[q.Name()] = pipe.LLen(q.Name())
+		})
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	totalQueued := 0
-	totalQueues := 0
-	// queue size is cached so this should be very efficient.
-	s.store.EachQueue(func(q storage.Queue) {
-		totalQueued += int(q.Size())
-		totalQueues++
-	})
+	queues := map[string]int64{}
+	totalQueued := int64(0)
+	totalQueues := len(queueCmd)
+	for name, cmd := range queueCmd {
+		qsize := cmd.Val()
+		totalQueued += qsize
+		queues[name] = qsize
+	}
 
 	return map[string]interface{}{
 		"server_utc_time": time.Now().UTC().Format("03:04:05 UTC"),
 		"faktory": map[string]interface{}{
-			"default_size":    defalt.Size(),
 			"total_failures":  s.store.TotalFailures(),
 			"total_processed": s.store.TotalProcessed(),
 			"total_enqueued":  totalQueued,
 			"total_queues":    totalQueues,
-			"tasks":           s.taskRunner.Stats()},
+			"queues":          queues,
+			"tasks":           s.taskRunner.Stats(),
+		},
 		"server": map[string]interface{}{
+			"description":     client.Name,
 			"faktory_version": client.Version,
 			"uptime":          s.uptimeInSeconds(),
 			"connections":     atomic.LoadUint64(&s.Stats.Connections),
 			"command_count":   atomic.LoadUint64(&s.Stats.Commands),
-			"used_memory_mb":  util.MemoryUsage()},
+			"used_memory_mb":  util.MemoryUsage(),
+		},
 	}, nil
 }

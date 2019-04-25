@@ -48,8 +48,15 @@ func ParseArguments() CliOptions {
 	}
 
 	if defaults.Environment == "development" {
-		usr, _ := user.Current()
-		dir := usr.HomeDir
+		envdir, ok := os.LookupEnv("HOME")
+		var dir string
+		if ok && envdir != "" {
+			dir = envdir
+		}
+		usr, err := user.Current()
+		if err == nil {
+			dir = usr.HomeDir
+		}
 		// development defaults to the user's home dir so everything is local and
 		// permissions aren't a problem.
 		if defaults.StorageDirectory == "/var/lib/faktory/db" {
@@ -235,6 +242,13 @@ func fetchPassword(cfg map[string]interface{}, env string) (string, error) {
 			// clear password so we can log it safely
 			x := cfg["faktory"].(map[string]interface{})
 			x["password"] = "********"
+		}
+	}
+
+	if env == "production" && !skip() && password == "" {
+		ok, _ := util.FileExists("/etc/faktory/password")
+		if ok {
+			password = "/etc/faktory/password"
 		}
 	}
 

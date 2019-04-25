@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -38,43 +39,41 @@ var (
 //go:generate go-bindata -pkg webui -o static.go static/...
 
 type localeMap map[string]map[string]string
+type assetLookup func(string) ([]byte, error)
 
 var (
-	locales = localeMap{}
+	AssetLookups = []assetLookup{Asset}
+	locales      = localeMap{}
 )
 
 func init() {
-	localeFiles, err := AssetDir("static/locales")
+	files, err := AssetDir("static/locales")
 	if err != nil {
 		panic(err)
 	}
-	for _, filename := range localeFiles {
+	for _, filename := range files {
 		name := strings.Split(filename, ".")[0]
 		locales[name] = nil
 	}
-	translations("en") // eager load English
-	//util.Debugf("Initialized %d locales", len(localeFiles))
+	//util.Debugf("Initialized %d locales", len(files))
 }
 
 type Lifecycle struct {
-	WebUI  *WebUI
-	uiopts Options
-	closer func()
+	WebUI          *WebUI
+	defaultBinding string
+	closer         func()
 }
 
 func Subsystem(binding string) *Lifecycle {
-	opts := defaultOptions()
-	opts.Binding = binding
 	return &Lifecycle{
-		uiopts: opts,
+		defaultBinding: binding,
 	}
 }
 
 type WebUI struct {
 	Options Options
 	Server  *server.Server
-
-	mux *http.ServeMux
+	Mux     *http.ServeMux
 }
 
 type Options struct {
@@ -96,30 +95,30 @@ func newWeb(s *server.Server, opts Options) *WebUI {
 		Options: opts,
 		Server:  s,
 
-		mux: http.NewServeMux(),
+		Mux: http.NewServeMux(),
 	}
 
-	ui.mux.HandleFunc("/static/", staticHandler)
-	ui.mux.HandleFunc("/stats", debugLog(ui, statsHandler))
+	ui.Mux.HandleFunc("/static/", staticHandler)
+	ui.Mux.HandleFunc("/stats", DebugLog(ui, statsHandler))
 
-	ui.mux.HandleFunc("/", log(ui, getOnly(indexHandler)))
-	ui.mux.HandleFunc("/queues", log(ui, queuesHandler))
-	ui.mux.HandleFunc("/queues/", log(ui, queueHandler))
-	ui.mux.HandleFunc("/retries", log(ui, retriesHandler))
-	ui.mux.HandleFunc("/retries/", log(ui, retryHandler))
-	ui.mux.HandleFunc("/scheduled", log(ui, scheduledHandler))
-	ui.mux.HandleFunc("/scheduled/", log(ui, scheduledJobHandler))
-	ui.mux.HandleFunc("/morgue", log(ui, morgueHandler))
-	ui.mux.HandleFunc("/morgue/", log(ui, deadHandler))
-	ui.mux.HandleFunc("/busy", log(ui, busyHandler))
-	ui.mux.HandleFunc("/debug", log(ui, debugHandler))
+	ui.Mux.HandleFunc("/", Log(ui, GetOnly(indexHandler)))
+	ui.Mux.HandleFunc("/queues", Log(ui, queuesHandler))
+	ui.Mux.HandleFunc("/queues/", Log(ui, queueHandler))
+	ui.Mux.HandleFunc("/retries", Log(ui, retriesHandler))
+	ui.Mux.HandleFunc("/retries/", Log(ui, retryHandler))
+	ui.Mux.HandleFunc("/scheduled", Log(ui, scheduledHandler))
+	ui.Mux.HandleFunc("/scheduled/", Log(ui, scheduledJobHandler))
+	ui.Mux.HandleFunc("/morgue", Log(ui, morgueHandler))
+	ui.Mux.HandleFunc("/morgue/", Log(ui, deadHandler))
+	ui.Mux.HandleFunc("/busy", Log(ui, busyHandler))
+	ui.Mux.HandleFunc("/debug", Log(ui, debugHandler))
 
 	return ui
 }
 
 func (l *Lifecycle) opts(s *server.Server) Options {
 	opts := defaultOptions()
-	opts.Binding = l.uiopts.Binding
+	opts.Binding = l.defaultBinding
 	if opts.Binding == "localhost:7420" {
 		opts.Binding = s.Options.String("web", "binding", "localhost:7420")
 	}
@@ -136,7 +135,6 @@ func (l *Lifecycle) opts(s *server.Server) Options {
 func (l *Lifecycle) Start(s *server.Server) error {
 	uiopts := l.opts(s)
 
-	l.uiopts = uiopts
 	l.WebUI = newWeb(s, uiopts)
 	closer, err := l.WebUI.Run()
 	if err != nil {
@@ -146,15 +144,18 @@ func (l *Lifecycle) Start(s *server.Server) error {
 	return nil
 }
 
+func (l *Lifecycle) Name() string {
+	return "Web UI"
+}
+
 func (l *Lifecycle) Reload(s *server.Server) error {
 	uiopts := l.opts(s)
 
-	if uiopts != l.uiopts {
+	if uiopts != l.WebUI.Options {
 		util.Infof("Reloading web interface")
 		l.closer()
 
-		l.uiopts = uiopts
-		l.WebUI = newWeb(s, uiopts)
+		l.WebUI.Options = uiopts
 		closer, err := l.WebUI.Run()
 		if err != nil {
 			return err
@@ -186,7 +187,7 @@ func (ui *WebUI) Run() (func(), error) {
 		ReadTimeout:    1 * time.Second,
 		WriteTimeout:   10 * time.Second,
 		MaxHeaderBytes: 1 << 16,
-		Handler:        ui.mux,
+		Handler:        ui.Mux,
 	}
 
 	go func() {
@@ -211,17 +212,19 @@ func translations(locale string) map[string]string {
 
 	if ok {
 		//util.Debugf("Booting the %s locale", locale)
-		content, err := Asset(fmt.Sprintf("static/locales/%s.yml", locale))
-		if err != nil {
-			panic(err)
-		}
-
 		strs := map[string]string{}
-		scn := bufio.NewScanner(bytes.NewReader(content))
-		for scn.Scan() {
-			kv := strings.Split(scn.Text(), ":")
-			if len(kv) == 2 {
-				strs[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
+		for _, finder := range AssetLookups {
+			content, err := finder(fmt.Sprintf("static/locales/%s.yml", locale))
+			if err != nil {
+				continue
+			}
+
+			scn := bufio.NewScanner(bytes.NewReader(content))
+			for scn.Scan() {
+				kv := strings.Split(scn.Text(), ":")
+				if len(kv) == 2 {
+					strs[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
+				}
 			}
 		}
 		locales[locale] = strs
@@ -273,15 +276,19 @@ func localeFromHeader(value string) string {
 	return "en"
 }
 
+func Layout(w io.Writer, req *http.Request, yield func()) {
+	ego_layout(w, req, yield)
+}
+
 /////////////////////////////////////
 
 // The stats handler is hit a lot and adds much noise to the log,
 // quiet it down.
-func debugLog(ui *WebUI, pass http.HandlerFunc) http.HandlerFunc {
+func DebugLog(ui *WebUI, pass http.HandlerFunc) http.HandlerFunc {
 	return setup(ui, pass, true)
 }
 
-func log(ui *WebUI, pass http.HandlerFunc) http.HandlerFunc {
+func Log(ui *WebUI, pass http.HandlerFunc) http.HandlerFunc {
 	return protect(ui.Options.EnableCSRF, setup(ui, pass, false))
 }
 
@@ -348,7 +355,7 @@ func basicAuth(pwd string, pass http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func getOnly(h http.HandlerFunc) http.HandlerFunc {
+func GetOnly(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "GET" {
 			h(w, r)
@@ -358,7 +365,7 @@ func getOnly(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func postOnly(h http.HandlerFunc) http.HandlerFunc {
+func PostOnly(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" {
 			h(w, r)

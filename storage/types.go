@@ -39,6 +39,7 @@ type Store interface {
 	Flush() error
 
 	Raw() KV
+	Redis
 }
 
 type Redis interface {
@@ -50,7 +51,7 @@ type Queue interface {
 	Size() uint64
 
 	Add(job *client.Job) error
-	Push(priority uint8, data []byte) error
+	Push(data []byte) error
 
 	Pop() ([]byte, error)
 	BPop(context.Context) ([]byte, error)
@@ -80,12 +81,15 @@ type SortedSet interface {
 	Page(start int, count int, fn func(index int, e SortedEntry) error) (int, error)
 	Each(fn func(idx int, e SortedEntry) error) error
 
+	Find(match string, fn func(idx int, e SortedEntry) error) error
+
 	// bool is whether or not the element was actually removed from the sset.
 	// the scheduler and other things can be operating on the sset concurrently
 	// so we need to be careful about the data changing under us.
 	Remove(key []byte) (bool, error)
 	RemoveElement(timestamp string, jid string) (bool, error)
 	RemoveBefore(timestamp string) ([][]byte, error)
+	RemoveEntry(ent SortedEntry) error
 
 	// Move the given key from this SortedSet to the given
 	// SortedSet atomically.  The given func may mutate the payload and

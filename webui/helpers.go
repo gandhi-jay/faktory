@@ -53,7 +53,7 @@ func pageparam(req *http.Request, pageValue uint64) string {
 }
 
 func currentStatus(req *http.Request) string {
-	if ctx(req).Store().Working().Size() == 0 {
+	if ctx(req).Server().Manager().WorkingCount() == 0 {
 		return "idle"
 	}
 	return "active"
@@ -219,6 +219,8 @@ func actOn(req *http.Request, set storage.SortedSet, action string, keys []strin
 		if len(keys) == 1 && keys[0] == "all" {
 			return ctx(req).Store().EnqueueAll(set)
 		} else {
+			// TODO Make this 180 day dead job expiry dynamic per-job or
+			// a global variable in TOML? PRs welcome.
 			expiry := time.Now().Add(180 * 24 * time.Hour)
 			for _, key := range keys {
 				entry, err := set.Get([]byte(key))
@@ -348,4 +350,37 @@ func sortedLocaleNames(req *http.Request, fn func(string, bool)) {
 	for _, name := range names {
 		fn(name, name == c.locale)
 	}
+}
+
+func displayArgs(args []interface{}) string {
+	return displayLimitedArgs(args, 1024)
+}
+
+func displayFullArgs(args []interface{}) string {
+	return displayLimitedArgs(args, 1024*1024)
+}
+
+func displayLimitedArgs(args []interface{}, limit int) string {
+	var b strings.Builder
+	for idx, arg := range args {
+		var s string
+		bytes, err := json.Marshal(arg)
+		if err != nil {
+			util.Warnf("Unable to marshal argument for display: %s", err)
+			s = fmt.Sprintf("%#v", arg)
+		} else {
+			s = string(bytes)
+		}
+		if len(s) > limit {
+			fmt.Fprintf(&b, s[0:limit])
+			b.WriteRune('…')
+		} else {
+			fmt.Fprintf(&b, s)
+		}
+		if idx+1 < len(args) {
+			b.WriteRune(',')
+			b.WriteRune(' ')
+		}
+	}
+	return b.String()
 }
